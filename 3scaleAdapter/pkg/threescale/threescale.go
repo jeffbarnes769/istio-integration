@@ -22,7 +22,9 @@ import (
 	backendC "github.com/3scale/3scale-go-client/client"
 	sysC "github.com/3scale/3scale-porta-go-client/client"
 	"github.com/3scale/istio-integration/3scaleAdapter/config"
+	"github.com/3scale/istio-integration/3scaleAdapter/pkg/threescale/metrics"
 	"github.com/gogo/googleapis/google/rpc"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"istio.io/api/mixer/adapter/model/v1beta1"
 	"istio.io/istio/mixer/pkg/status"
@@ -40,10 +42,17 @@ type (
 
 	// Threescale contains the Listener and the server
 	Threescale struct {
-		listener   net.Listener
-		server     *grpc.Server
-		client     *http.Client
-		proxyCache *ProxyConfigCache
+		listener      net.Listener
+		server        *grpc.Server
+		client        *http.Client
+		proxyCache    *ProxyConfigCache
+		reportMetrics bool
+	}
+
+	// MetricsConfig configures Prometheus metrics settings
+	MetricsConfig struct {
+		gatherMetrics bool
+		port          int
 	}
 )
 
@@ -53,6 +62,12 @@ var _ authorization.HandleAuthorizationServiceServer = &Threescale{}
 
 // HandleAuthorization takes care of the authorization request from mixer
 func (s *Threescale) HandleAuthorization(ctx context.Context, r *authorization.HandleAuthorizationRequest) (*v1beta1.CheckResult, error) {
+	go func() {
+		if s.reportMetrics {
+			metrics.IncrementTotalRequests()
+		}
+	}()
+
 	var result v1beta1.CheckResult
 
 	log.Debugf("Got instance %+v", r.Instance)
@@ -114,7 +129,7 @@ func (s *Threescale) isAuthorized(cfg *config.Params, request authorization.Inst
 	if s.proxyCache != nil {
 		pce, proxyConfErr = s.proxyCache.get(cfg, c)
 	} else {
-		pce, proxyConfErr = getFromRemote(cfg, c)
+		pce, proxyConfErr = getFromRemote(cfg, c, s.reportMetrics)
 	}
 
 	if proxyConfErr != nil {
@@ -149,11 +164,13 @@ func (s *Threescale) doAuthRep(svcID string, userKey string, request authorizati
 			request.Action.Method, request.Action.Path)), nil
 	}
 
+	start := time.Now()
 	if conf.Content.BackendAuthenticationType == "provider_key" {
 		resp, apiErr = bc.AuthRepProviderKey(userKey, conf.Content.BackendAuthenticationValue, svcID, params)
 	} else {
 		resp, apiErr = bc.AuthRepKey(userKey, conf.Content.BackendAuthenticationValue, svcID, params)
 	}
+	elapsed := time.Since(start)
 
 	if apiErr != nil {
 		return status.WithMessage(2, fmt.Sprintf("error calling 3scale AuthRep -  %s", apiErr.Error())), apiErr
@@ -162,6 +179,8 @@ func (s *Threescale) doAuthRep(svcID string, userKey string, request authorizati
 	if !resp.Success {
 		return status.WithPermissionDenied(resp.Reason), nil
 	}
+
+	go metrics.ObserveBackendLatency(conf.Content.Proxy.Backend.Endpoint, svcID, elapsed)
 
 	return status.OK, nil
 }
@@ -260,7 +279,7 @@ func (s *Threescale) Close() error {
 }
 
 // NewThreescale returns a Server interface
-func NewThreescale(addr string, client *http.Client, proxyCache *ProxyConfigCache) (Server, error) {
+func NewThreescale(addr string, client *http.Client, proxyCache *ProxyConfigCache, metricsConf *MetricsConfig) (Server, error) {
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", addr))
 	if err != nil {
@@ -273,10 +292,32 @@ func NewThreescale(addr string, client *http.Client, proxyCache *ProxyConfigCach
 		proxyCache: proxyCache,
 	}
 
+	if metricsConf != nil {
+		if metricsConf.gatherMetrics {
+			s.reportMetrics = true
+		}
+
+		if proxyCache != nil {
+			proxyCache.reportMetrics = true
+		}
+
+		http.Handle("/metrics", promhttp.Handler())
+		go func() {
+			if err := http.ListenAndServe(fmt.Sprintf(":%d", metricsConf.port), nil); err != nil {
+				panic("panic")
+			}
+		}()
+	}
+
 	log.Infof("Threescale Istio Adapter is listening on \"%v\"\n", s.Addr())
 
 	s.server = grpc.NewServer()
 	authorization.RegisterHandleAuthorizationServiceServer(s.server, s)
 	// TODO: Add report template for metrics.
 	return s, nil
+}
+
+// NewMetricsConfig - Creates a MetricsConfig which controls metric behaviour
+func NewMetricsConfig(gatherMetrics bool, port int) *MetricsConfig {
+	return &MetricsConfig{gatherMetrics, port}
 }

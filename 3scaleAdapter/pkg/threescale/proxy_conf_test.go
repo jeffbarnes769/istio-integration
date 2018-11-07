@@ -198,7 +198,7 @@ func TestProxyConfigCacheRefreshing(t *testing.T) {
 	pc := NewProxyConfigCache(time.Duration(ttl), time.Duration(ttl), 3)
 	proxyConf = unmarshalConfig(t)
 
-	c := &Threescale{client: httpClient, proxyCache: pc}
+	c := &Threescale{client: httpClient, proxyCache: pc, reportMetrics: true}
 	sysClient, err := c.systemClientBuilder("https://www.fake-system.3scale.net")
 	if err != nil {
 		t.Fatalf("unexpected error builoding system client")
